@@ -1,0 +1,12 @@
+[project]
+name = "shpack"
+version = "1.0.0"
+description = "pack folders into .shp files for easy sharing"
+requires-python = ">=3.10"
+
+[project.scripts]
+shpack = "shpack:main"
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.backends._legacy:_Backend"

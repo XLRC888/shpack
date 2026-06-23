@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+import argparse
+import io
+import json
+import os
+import shutil
+import stat as statmod
+import sys
+import time
+import zipfile
+from pathlib import Path
+
+META_FILE = ".shpmeta"
+FORMAT_VER = 1
+
+SFX_STUB = Path(__file__).resolve().parent / "sfx_stub.exe"
+
+def pack(args):
+    src = Path(args.source).resolve()
+    if not src.is_dir():
+        print(f"error: '{src}' is not a directory or doesn't exist", file=sys.stderr)
+        sys.exit(1)
+
+    is_sfx = args.sfx
+    ext = ".exe" if is_sfx else ".shp"
+    dst = Path(args.outfile or args.outfile_opt or str(src.with_name(src.name + ext)))
+    if dst.exists() and not args.force:
+        print(f"error: '{dst}' already exists (use --force to overwrite)", file=sys.stderr)
+        sys.exit(1)
+
+    file_count = 0
+    dir_count = 0
+    total_bytes = 0
+    for root, dirs, files in os.walk(src):
+        dir_count += len(dirs)
+        file_count += len(files)
+        for f in files:
+            fp = os.path.join(root, f)
+            try:
+                total_bytes += os.path.getsize(fp)
+            except OSError:
+                pass
+
+    meta = {
+        "name": src.name,
+        "created": time.time(),
+        "files": file_count,
+        "dirs": dir_count,
+        "size": total_bytes,
+        "ver": FORMAT_VER,
+        "tool": "shpack"
+    }
+
+    tmpzip = dst.with_name(dst.name + ".tmp")
+    try:
+        with zipfile.ZipFile(tmpzip, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(META_FILE, json.dumps(meta, indent=2))
+            for root, dirs, files in os.walk(src):
+                for f in files:
+                    fp = os.path.join(root, f)
+                    arcname = os.path.join(src.name, os.path.relpath(fp, src))
+                    zf.write(fp, arcname)
+                for d in dirs:
+                    dp = os.path.join(root, d)
+                    arcname = os.path.join(src.name, os.path.relpath(dp, src)) + "/"
+                    zi = zipfile.ZipInfo(arcname)
+                    zi.date_time = time.localtime(time.time())[:6]
+                    zf.writestr(zi, "")
+
+        if is_sfx:
+            stub_path = args.stub or SFX_STUB
+            if not stub_path.exists():
+                print(f"error: SFX stub not found at '{stub_path}'", file=sys.stderr)
+                sys.exit(1)
+            with open(dst, "wb") as fout:
+                with open(stub_path, "rb") as fstub:
+                    shutil.copyfileobj(fstub, fout)
+                with open(tmpzip, "rb") as fzip:
+                    shutil.copyfileobj(fzip, fout)
+            os.remove(tmpzip)
+        else:
+            os.rename(tmpzip, dst)
+
+    except BaseException:
+        if tmpzip.exists():
+            os.remove(tmpzip)
+        raise
+
+    packed_size = dst.stat().st_size
+    ratio = (packed_size / total_bytes * 100) if total_bytes else 0
+    fmt = "SFX" if is_sfx else "ZIP"
+    print(f"packed {src.name} ({file_count} files, {dir_count} dirs, {total_bytes:,} raw)")
+    print(f"  -> {dst.name} ({fmt}, {packed_size:,} bytes, {ratio:.1f}%)")
+
+
+def unpack(args):
+    src = Path(args.source).resolve()
+    if not src.is_file():
+        print(f"error: '{src}' is not a file", file=sys.stderr)
+        sys.exit(1)
+
+    dst_base = (Path(args.outdir or args.outdir_opt).resolve()
+                if (args.outdir or args.outdir_opt) else Path.cwd())
+
+    meta = read_meta(src)
+
+    with zipfile.ZipFile(src, "r") as zf:
+        if args.list_only:
+            for name in zf.namelist():
+                if name != META_FILE:
+                    print(name)
+            return
+
+        all_names = [n for n in zf.namelist() if n != META_FILE]
+
+        top_level = None
+        for name in all_names:
+            parts = Path(name).parts
+            if parts:
+                candidate = parts[0]
+                if top_level is None:
+                    top_level = candidate
+                elif top_level != candidate:
+                    top_level = None
+
+        extract_dir = dst_base
+        if top_level and not args.no_dir:
+            extract_dir = dst_base / (meta.get("name") or top_level)
+            if extract_dir.exists() and not args.force:
+                print(f"error: '{extract_dir}' exists (use --force)", file=sys.stderr)
+                sys.exit(1)
+
+        zf.extractall(path=dst_base, members=all_names)
+
+    out = extract_dir if (top_level and not args.no_dir) else dst_base
+    fcount = sum(1 for n in all_names if not n.endswith("/"))
+    print(f"unpacked {fcount} items to {out}")
+
+
+def list_contents(args):
+    src = Path(args.source).resolve()
+    if not src.is_file():
+        print(f"error: '{src}' is not a file", file=sys.stderr)
+        sys.exit(1)
+
+    meta = read_meta(src)
+    print(f"shpack v{meta.get('ver', '?')} | {meta.get('name', '?')}")
+    print(f"  {meta.get('files', 0)} files, {meta.get('dirs', 0)} dirs")
+    print(f"  raw size: {meta.get('size', 0):,} bytes")
+    created = meta.get("created", 0)
+    if created:
+        print(f"  created: {time.ctime(created)}")
+    print()
+
+    with zipfile.ZipFile(src, "r") as zf:
+        for zi in zf.infolist():
+            if zi.filename == META_FILE:
+                continue
+            is_dir = zi.filename.endswith("/")
+            sz = f"{zi.file_size:>10,}" if not is_dir else " " * 10
+            perm = (zi.external_attr >> 16) & 0o7777
+            if is_dir:
+                fullmode = statmod.S_IFDIR | (perm if perm else 0o755)
+            else:
+                fullmode = statmod.S_IFREG | (perm if perm else 0o644)
+            modestr = statmod.filemode(fullmode)
+            print(f"{modestr} {sz} {zi.filename}")
+
+
+def info(args):
+    src = Path(args.source).resolve()
+    if not src.is_file():
+        print(f"error: '{src}' is not a file", file=sys.stderr)
+        sys.exit(1)
+
+    meta = read_meta(src)
+    print(f"file:     {src.name}")
+    print(f"size:     {src.stat().st_size:,} bytes")
+    print(f"format:   shpack v{meta.get('ver', '?')}")
+    print(f"folder:   {meta.get('name', '?')}")
+    print(f"files:    {meta.get('files', 0)}")
+    print(f"dirs:     {meta.get('dirs', 0)}")
+    print(f"raw size: {meta.get('size', 0):,} bytes")
+    created = meta.get("created", 0)
+    if created:
+        print(f"created:  {time.ctime(created)}")
+
+
+def read_meta(path):
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            try:
+                data = zf.read(META_FILE)
+            except KeyError:
+                print(f"error: not a valid shpack (no {META_FILE})", file=sys.stderr)
+                sys.exit(1)
+            return json.loads(data.decode("utf-8"))
+    except (zipfile.BadZipfile, OSError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="shpack - folder sharing done right")
+    ap.add_argument("--force", "-f", action="store_true", help="overwrite existing output")
+
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("pack", help="pack a folder into .shp")
+    p.add_argument("source", help="folder to pack")
+    p.add_argument("outfile", nargs="?", help="output file (default: <folder>.shp)")
+    p.add_argument("-o", "--output", dest="outfile_opt", help=argparse.SUPPRESS)
+    p.add_argument("--force", "-f", action="store_true", dest="force")
+    p.add_argument("--sfx", action="store_true", help="create self-extracting .exe (Windows)")
+    p.add_argument("--stub", help="custom SFX stub binary path")
+
+    p = sub.add_parser("unpack", help="extract a .shp file")
+    p.add_argument("source", help=".shp or .exe file to unpack")
+    p.add_argument("outdir", nargs="?", help="output directory (default: current dir)")
+    p.add_argument("-o", "--output", dest="outdir_opt", help=argparse.SUPPRESS)
+    p.add_argument("--force", "-f", action="store_true", dest="force")
+    p.add_argument("--no-dir", action="store_true", help="don't wrap in folder")
+    p.add_argument("--list", action="store_true", dest="list_only", help="just list contents")
+
+    p = sub.add_parser("list", help="list contents of a .shp file")
+    p.add_argument("source", help=".shp or .exe file")
+
+    p = sub.add_parser("info", help="show metadata of a .shp file")
+    p.add_argument("source", help=".shp or .exe file")
+
+    args = ap.parse_args()
+
+    if args.cmd == "pack":
+        pack(args)
+    elif args.cmd == "unpack":
+        unpack(args)
+    elif args.cmd == "list":
+        list_contents(args)
+    elif args.cmd == "info":
+        info(args)
+
+
+if __name__ == "__main__":
+    main()

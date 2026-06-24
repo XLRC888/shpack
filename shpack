@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 import argparse
-import io
 import json
 import os
 import shutil
-import signal
 import stat as statmod
 import subprocess
 import sys
@@ -81,18 +79,18 @@ def pack(args):
                     shutil.copyfileobj(fzip, fout)
             os.remove(tmpzip)
         else:
-            os.rename(tmpzip, dst)
+            shutil.move(tmpzip, dst)
 
-    except BaseException:
+        packed_size = dst.stat().st_size
+        ratio = (packed_size / total_bytes * 100) if total_bytes else 0
+        fmt = "SFX" if is_sfx else "ZIP"
+        print(f"packed {src.name} ({file_count} files, {dir_count} dirs, {total_bytes:,} raw)")
+        print(f"  -> {dst.name} ({fmt}, {packed_size:,} bytes, {ratio:.1f}%)")
+
+    except Exception:
         if tmpzip.exists():
             os.remove(tmpzip)
         raise
-
-    packed_size = dst.stat().st_size
-    ratio = (packed_size / total_bytes * 100) if total_bytes else 0
-    fmt = "SFX" if is_sfx else "ZIP"
-    print(f"packed {src.name} ({file_count} files, {dir_count} dirs, {total_bytes:,} raw)")
-    print(f"  -> {dst.name} ({fmt}, {packed_size:,} bytes, {ratio:.1f}%)")
 
 
 def unpack(args):
@@ -114,6 +112,12 @@ def unpack(args):
             return
 
         all_names = [n for n in zf.namelist() if n != META_FILE]
+
+        for n in all_names:
+            p = Path(n).as_posix()
+            if ".." in p.split("/"):
+                print(f"error: '{src}' contains path traversal entries", file=sys.stderr)
+                sys.exit(1)
 
         top_level = None
         for name in all_names:
@@ -197,7 +201,7 @@ def read_meta(path):
                 print(f"error: not a valid shpack (no {META_FILE})", file=sys.stderr)
                 sys.exit(1)
             return json.loads(data.decode("utf-8"))
-    except (zipfile.BadZipfile, OSError) as e:
+    except (zipfile.BadZipfile, OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(1)
 
@@ -283,15 +287,21 @@ class ShpFS:
         if path not in self.files:
             import fuse
             raise fuse.FuseOSError(fuse.errno.ENOENT)
+        if flags & 3:
+            import fuse
+            raise fuse.FuseOSError(fuse.errno.EROFS)
         return 1
 
     def read(self, path, size, offset, fh):
         path = path.lstrip("/")
-        data = self.zf.read(path)
-        return data[offset:offset + size]
+        if not hasattr(self, "_cache") or self._cache_path != path:
+            self._cache = self.zf.read(path)
+            self._cache_path = path
+        return self._cache[offset:offset + size]
 
     def release(self, path, fh):
-        pass
+        self._cache = None
+        self._cache_path = None
 
     def statfs(self, path):
         return dict(f_bsize=4096, f_frsize=4096, f_blocks=0, f_bfree=0,

@@ -4,12 +4,9 @@
 #include <string.h>
 
 #define EOCD_SIG 0x06054b50
-#define LOC_SIG  0x04034b50
 #define CEN_SIG  0x02014b50
+#define LOC_SIG  0x04034b50
 #define COMPRESSION_FORMAT_DEFLATE 0x0002
-
-#pragma comment(lib, "shell32.lib")
-#pragma comment(lib, "ole32.lib")
 
 typedef struct {
     DWORD sig;
@@ -57,7 +54,6 @@ typedef struct {
 } LocEntry;
 
 typedef NTSTATUS (WINAPI *RtlDecompress_t)(USHORT, PUCHAR, ULONG, PUCHAR, ULONG, PULONG);
-
 static RtlDecompress_t RtlDecompress = NULL;
 
 static int load_decompressor(void)
@@ -80,11 +76,29 @@ static int write_file(const char *path, const BYTE *data, DWORD size)
     return ok;
 }
 
+static int has_dotdot(const char *path, WORD len)
+{
+    WORD dots = 0;
+    for (WORD i = 0; i < len; i++) {
+        if (path[i] == '.') { dots++; }
+        else if (path[i] == '/' || path[i] == '\\') {
+            if (dots == 2) return 1;
+            dots = 0;
+        }
+        else { dots = 0; }
+    }
+    return dots == 2;
+}
+
 static int ensure_dirs(const char *full_path)
 {
     char buf[MAX_PATH];
-    strncpy(buf, full_path, sizeof(buf));
-    for (char *p = buf + 3; *p; p++) {
+    buf[0] = 0;
+    strncat(buf, full_path, sizeof(buf) - 1);
+    char *p = buf;
+    if (p[0] && p[1] == ':') p += 3;
+    else if (p[0] == '\\' && p[1] == '\\') { p += 2; while (*p && *p != '\\') p++; if (*p) p++; }
+    for (; *p; p++) {
         if (*p == '\\') {
             *p = 0;
             CreateDirectoryA(buf, NULL);
@@ -94,17 +108,25 @@ static int ensure_dirs(const char *full_path)
     return 1;
 }
 
+static DWORD read_at(HANDLE hFile, DWORD offset, void *buf, DWORD size)
+{
+    OVERLAPPED ov = {0};
+    ov.Offset = offset;
+    DWORD read;
+    if (!ReadFile(hFile, buf, size, &read, &ov)) return 0;
+    return read;
+}
+
 static DWORD find_eocd(HANDLE hFile, DWORD filesize)
 {
-    DWORD pos = filesize < 65557 ? 0 : filesize - 65557;
-    DWORD buf_size = filesize - pos;
+    DWORD search_start = filesize < 65557 ? 0 : filesize - 65557;
+    DWORD buf_size = filesize - search_start;
+    if (buf_size < 22) return 0;
+
     BYTE *buf = (BYTE*)HeapAlloc(GetProcessHeap(), 0, buf_size);
     if (!buf) return 0;
 
-    OVERLAPPED ov = {0};
-    ov.Offset = pos;
-    DWORD read;
-    if (!ReadFile(hFile, buf, buf_size, &read, NULL)) {
+    if (read_at(hFile, search_start, buf, buf_size) != buf_size) {
         HeapFree(GetProcessHeap(), 0, buf);
         return 0;
     }
@@ -112,13 +134,19 @@ static DWORD find_eocd(HANDLE hFile, DWORD filesize)
     DWORD eocd_pos = 0;
     for (DWORD i = buf_size - 22; i > 0; i--) {
         if (*(DWORD*)(buf + i) == EOCD_SIG) {
-            eocd_pos = pos + i;
-            break;
+            WORD comment_len = *(WORD*)(buf + i + 20);
+            if (search_start + i + 22 + comment_len == filesize) {
+                eocd_pos = search_start + i;
+                break;
+            }
         }
     }
     if (eocd_pos == 0 && buf_size >= 22) {
-        if (*(DWORD*)(buf) == EOCD_SIG)
-            eocd_pos = pos;
+        if (*(DWORD*)(buf) == EOCD_SIG) {
+            WORD comment_len = *(WORD*)(buf + 20);
+            if (search_start + 22 + comment_len == filesize)
+                eocd_pos = search_start;
+        }
     }
 
     HeapFree(GetProcessHeap(), 0, buf);
@@ -138,12 +166,10 @@ static int extract_zip(const char *self_path, const char *dest_dir)
     if (eocd_off == 0) { CloseHandle(hFile); return 1; }
 
     EocdRec eocd;
-    OVERLAPPED ov = {0};
-    ov.Offset = eocd_off;
-    DWORD read;
-    if (!ReadFile(hFile, &eocd, sizeof(eocd), &read, NULL)) {
+    if (read_at(hFile, eocd_off, &eocd, sizeof(eocd)) != sizeof(eocd)) {
         CloseHandle(hFile); return 1;
     }
+    if (eocd.sig != EOCD_SIG) { CloseHandle(hFile); return 1; }
 
     DWORD cd_pos = eocd.cd_offset;
     WORD total_entries = eocd.cd_entries_total;
@@ -152,17 +178,23 @@ static int extract_zip(const char *self_path, const char *dest_dir)
 
     for (WORD i = 0; i < total_entries; i++) {
         CenEntry cen;
-        memset(&ov, 0, sizeof(ov));
-        ov.Offset = cd_pos;
-        if (!ReadFile(hFile, &cen, sizeof(cen), &read, NULL)) break;
+        if (read_at(hFile, cd_pos, &cen, sizeof(cen)) != sizeof(cen)) break;
         if (cen.sig != CEN_SIG) break;
 
-        char *name = (char*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, cen.name_len + 1);
+        if (cen.name_len == 0) { cd_pos += sizeof(cen) + cen.extra_len + cen.comment_len; continue; }
+
+        char *name = (char*)HeapAlloc(GetProcessHeap(), 0, cen.name_len + 1);
         if (!name) { CloseHandle(hFile); return 1; }
-        memset(&ov, 0, sizeof(ov));
-        ov.Offset = cd_pos + sizeof(cen);
-        ReadFile(hFile, name, cen.name_len, &read, NULL);
+        if (read_at(hFile, cd_pos + sizeof(cen), name, cen.name_len) != cen.name_len) {
+            HeapFree(GetProcessHeap(), 0, name); break;
+        }
         name[cen.name_len] = 0;
+
+        if (has_dotdot(name, cen.name_len)) {
+            cd_pos += sizeof(cen) + cen.name_len + cen.extra_len + cen.comment_len;
+            HeapFree(GetProcessHeap(), 0, name);
+            continue;
+        }
 
         int is_dir = name[cen.name_len - 1] == '/';
 
@@ -181,32 +213,30 @@ static int extract_zip(const char *self_path, const char *dest_dir)
             ensure_dirs(full_path);
 
             LocEntry loc;
-            memset(&ov, 0, sizeof(ov));
-            ov.Offset = cen.local_offset;
-            ReadFile(hFile, &loc, sizeof(loc), &read, NULL);
-
-            DWORD data_off = cen.local_offset + sizeof(loc) + loc.name_len + loc.extra_len;
-            BYTE *comp = (BYTE*)HeapAlloc(GetProcessHeap(), 0, cen.comp_size);
-            if (!comp) { HeapFree(GetProcessHeap(), 0, name); break; }
-            memset(&ov, 0, sizeof(ov));
-            ov.Offset = data_off;
-            ReadFile(hFile, comp, cen.comp_size, &read, NULL);
-
-            if (cen.method == 0) {
-                write_file(full_path, comp, cen.uncomp_size);
-            } else if (cen.method == 8 && RtlDecompress) {
-                BYTE *uncomp = (BYTE*)HeapAlloc(GetProcessHeap(), 0, cen.uncomp_size);
-                if (uncomp) {
-                    ULONG final_size = 0;
-                    NTSTATUS status = RtlDecompress(COMPRESSION_FORMAT_DEFLATE,
-                        uncomp, cen.uncomp_size, comp, cen.comp_size, &final_size);
-                    if (status == 0)
-                        write_file(full_path, uncomp, final_size);
-                    HeapFree(GetProcessHeap(), 0, uncomp);
+            if (read_at(hFile, cen.local_offset, &loc, sizeof(loc)) == sizeof(loc) && loc.sig == LOC_SIG) {
+                DWORD data_off = cen.local_offset + sizeof(loc) + loc.name_len + loc.extra_len;
+                if (cen.comp_size > 0) {
+                    BYTE *comp = (BYTE*)HeapAlloc(GetProcessHeap(), 0, cen.comp_size);
+                    if (comp) {
+                        if (read_at(hFile, data_off, comp, cen.comp_size) == cen.comp_size) {
+                            if (cen.method == 0) {
+                                write_file(full_path, comp, cen.uncomp_size);
+                            } else if (cen.method == 8 && RtlDecompress && cen.uncomp_size > 0) {
+                                BYTE *uncomp = (BYTE*)HeapAlloc(GetProcessHeap(), 0, cen.uncomp_size);
+                                if (uncomp) {
+                                    ULONG final_size = 0;
+                                    NTSTATUS status = RtlDecompress(COMPRESSION_FORMAT_DEFLATE,
+                                        uncomp, cen.uncomp_size, comp, cen.comp_size, &final_size);
+                                    if (status == 0)
+                                        write_file(full_path, uncomp, final_size);
+                                    HeapFree(GetProcessHeap(), 0, uncomp);
+                                }
+                            }
+                        }
+                        HeapFree(GetProcessHeap(), 0, comp);
+                    }
                 }
             }
-
-            HeapFree(GetProcessHeap(), 0, comp);
         }
 
         cd_pos += sizeof(cen) + cen.name_len + cen.extra_len + cen.comment_len;
@@ -223,7 +253,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
     GetModuleFileNameA(NULL, self, MAX_PATH);
 
     char dest[MAX_PATH];
-    strncpy(dest, self, sizeof(dest));
+    dest[0] = 0;
+    strncat(dest, self, sizeof(dest) - 1);
     char *dot = strrchr(dest, '.');
     if (dot) *dot = 0;
 

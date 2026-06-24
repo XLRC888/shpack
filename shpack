@@ -22,7 +22,7 @@ def pack(args):
         sys.exit(1)
 
     is_sfx = args.sfx
-    ext = ".exe" if is_sfx else ".shp"
+    ext = ".shp.exe" if is_sfx else ".shp"
     dst = Path(args.outfile or args.outfile_opt or str(src.with_name(src.name + ext)))
     if dst.exists() and not args.force:
         print(f"error: '{dst}' already exists (use --force to overwrite)", file=sys.stderr)

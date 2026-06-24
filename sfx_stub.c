@@ -171,27 +171,28 @@ static int extract_zip(const char *self_path, const char *dest_dir)
     }
     if (eocd.sig != EOCD_SIG) { CloseHandle(hFile); return 1; }
 
-    DWORD cd_pos = eocd.cd_offset;
+    DWORD zip_start = eocd_off - eocd.cd_size - eocd.cd_offset;
+    DWORD cd_abs = zip_start + eocd.cd_offset;
     WORD total_entries = eocd.cd_entries_total;
 
     load_decompressor();
 
     for (WORD i = 0; i < total_entries; i++) {
         CenEntry cen;
-        if (read_at(hFile, cd_pos, &cen, sizeof(cen)) != sizeof(cen)) break;
+        if (read_at(hFile, cd_abs, &cen, sizeof(cen)) != sizeof(cen)) break;
         if (cen.sig != CEN_SIG) break;
 
-        if (cen.name_len == 0) { cd_pos += sizeof(cen) + cen.extra_len + cen.comment_len; continue; }
+        if (cen.name_len == 0) { cd_abs += sizeof(cen) + cen.extra_len + cen.comment_len; continue; }
 
         char *name = (char*)HeapAlloc(GetProcessHeap(), 0, cen.name_len + 1);
         if (!name) { CloseHandle(hFile); return 1; }
-        if (read_at(hFile, cd_pos + sizeof(cen), name, cen.name_len) != cen.name_len) {
+        if (read_at(hFile, cd_abs + sizeof(cen), name, cen.name_len) != cen.name_len) {
             HeapFree(GetProcessHeap(), 0, name); break;
         }
         name[cen.name_len] = 0;
 
         if (has_dotdot(name, cen.name_len)) {
-            cd_pos += sizeof(cen) + cen.name_len + cen.extra_len + cen.comment_len;
+            cd_abs += sizeof(cen) + cen.name_len + cen.extra_len + cen.comment_len;
             HeapFree(GetProcessHeap(), 0, name);
             continue;
         }
@@ -212,9 +213,10 @@ static int extract_zip(const char *self_path, const char *dest_dir)
 
             ensure_dirs(full_path);
 
+            DWORD loc_abs = zip_start + cen.local_offset;
             LocEntry loc;
-            if (read_at(hFile, cen.local_offset, &loc, sizeof(loc)) == sizeof(loc) && loc.sig == LOC_SIG) {
-                DWORD data_off = cen.local_offset + sizeof(loc) + loc.name_len + loc.extra_len;
+            if (read_at(hFile, loc_abs, &loc, sizeof(loc)) == sizeof(loc) && loc.sig == LOC_SIG) {
+                DWORD data_off = loc_abs + sizeof(loc) + loc.name_len + loc.extra_len;
                 if (cen.comp_size > 0) {
                     BYTE *comp = (BYTE*)HeapAlloc(GetProcessHeap(), 0, cen.comp_size);
                     if (comp) {
@@ -239,7 +241,7 @@ static int extract_zip(const char *self_path, const char *dest_dir)
             }
         }
 
-        cd_pos += sizeof(cen) + cen.name_len + cen.extra_len + cen.comment_len;
+        cd_abs += sizeof(cen) + cen.name_len + cen.extra_len + cen.comment_len;
         HeapFree(GetProcessHeap(), 0, name);
     }
 

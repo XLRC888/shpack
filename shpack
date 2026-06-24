@@ -4,7 +4,9 @@ import io
 import json
 import os
 import shutil
+import signal
 import stat as statmod
+import subprocess
 import sys
 import time
 import zipfile
@@ -200,6 +202,174 @@ def read_meta(path):
         sys.exit(1)
 
 
+def _ensure_fuse():
+    try:
+        import fuse
+        return fuse
+    except ImportError:
+        be = Path.home() / "dev" / "bestenv" / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+        if be.exists():
+            sys.path.insert(0, str(be))
+            import fuse
+            return fuse
+        print("error: fusepy not installed. run: pip install fusepy", file=sys.stderr)
+        sys.exit(1)
+
+
+class ShpFS:
+    def __init__(self, shp_path):
+        self.zf = zipfile.ZipFile(shp_path, "r")
+        self.dirs = set()
+        self.files = {}
+        for zi in self.zf.infolist():
+            if zi.filename == META_FILE:
+                continue
+            if zi.filename.endswith("/"):
+                self.dirs.add(zi.filename)
+            else:
+                self.files[zi.filename] = zi
+                parts = zi.filename.split("/")
+                for i in range(1, len(parts)):
+                    self.dirs.add("/".join(parts[:i]) + "/")
+        si = os.stat(shp_path)
+        self.uid = os.getuid()
+        self.gid = os.getgid()
+        self.atime = si.st_atime
+        self.mtime = si.st_mtime
+        self.ctime = si.st_ctime
+
+    def __call__(self, op, *args):
+        return getattr(self, op)(*args)
+
+    def getattr(self, path, fh=None):
+        path = path.lstrip("/")
+        if path == "":
+            return dict(st_mode=statmod.S_IFDIR | 0o555, st_nlink=2, st_size=0,
+                        st_uid=self.uid, st_gid=self.gid,
+                        st_atime=self.atime, st_mtime=self.mtime, st_ctime=self.ctime)
+        dp = path + "/" if not path.endswith("/") else path
+        if dp in self.dirs:
+            return dict(st_mode=statmod.S_IFDIR | 0o555, st_nlink=2, st_size=0,
+                        st_uid=self.uid, st_gid=self.gid,
+                        st_atime=self.atime, st_mtime=self.mtime, st_ctime=self.ctime)
+        if path in self.files:
+            zi = self.files[path]
+            return dict(st_mode=statmod.S_IFREG | 0o444, st_nlink=1, st_size=zi.file_size,
+                        st_uid=self.uid, st_gid=self.gid,
+                        st_atime=self.atime, st_mtime=self.mtime, st_ctime=self.ctime)
+        import fuse
+        raise fuse.FuseOSError(fuse.errno.ENOENT)
+
+    def readdir(self, path, fh):
+        path = path.lstrip("/")
+        dp = path + "/" if path and not path.endswith("/") else path
+        entries = [".", ".."]
+        for d in sorted(self.dirs):
+            if not d.startswith(dp) or d == dp:
+                continue
+            rest = d[len(dp):].rstrip("/")
+            if "/" not in rest:
+                entries.append(rest)
+        for f in sorted(self.files):
+            if not f.startswith(dp):
+                continue
+            rest = f[len(dp):]
+            if "/" not in rest:
+                entries.append(rest)
+        return entries
+
+    def open(self, path, flags):
+        path = path.lstrip("/")
+        if path not in self.files:
+            import fuse
+            raise fuse.FuseOSError(fuse.errno.ENOENT)
+        return 1
+
+    def read(self, path, size, offset, fh):
+        path = path.lstrip("/")
+        data = self.zf.read(path)
+        return data[offset:offset + size]
+
+    def release(self, path, fh):
+        pass
+
+    def statfs(self, path):
+        return dict(f_bsize=4096, f_frsize=4096, f_blocks=0, f_bfree=0,
+                    f_bavail=0, f_files=len(self.files), f_ffree=0,
+                    f_favail=0, f_flag=0, f_namemax=255)
+
+
+def mount_file(args):
+    fuse = _ensure_fuse()
+    src = Path(args.source).resolve()
+    if not src.is_file():
+        print(f"error: '{src}' is not a file", file=sys.stderr)
+        sys.exit(1)
+
+    if args.mountpoint:
+        mnt = Path(args.mountpoint).resolve()
+    else:
+        name = src.name
+        for ext in [".shp.exe", ".shp"]:
+            if name.endswith(ext):
+                name = name[:-len(ext)]
+                break
+        mnt = src.with_name(name).resolve()
+        if mnt.exists() and not args.force:
+            print(f"error: '{mnt}' exists (use --force to mount anyway)", file=sys.stderr)
+            sys.exit(1)
+
+    mnt.mkdir(parents=True, exist_ok=True)
+
+    fs = ShpFS(str(src))
+    if args.background:
+        fuse.FUSE(fs, str(mnt), foreground=False, allow_other=False)
+        print(f"mounted {src.name} at {mnt}")
+    else:
+        print(f"mounted {src.name} at {mnt}  (ctrl+c to unmount)")
+        try:
+            fuse.FUSE(fs, str(mnt), foreground=True, allow_other=False)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            subprocess.run(["fusermount3", "-u", str(mnt)], capture_output=True)
+
+
+def umount_file(args):
+    target = Path(args.target).resolve()
+    if target.is_file():
+        guess = target.with_name(target.stem).resolve()
+        if guess.is_mount():
+            target = guess
+        else:
+            try:
+                r = subprocess.run(["findmnt", "-nlo", "TARGET", "-t", "fuse"], 
+                                  capture_output=True, text=True)
+                for line in r.stdout.strip().split("\n"):
+                    mp = line.strip()
+                    if not mp:
+                        continue
+                    mp_name = Path(mp).name
+                    if mp_name == target.stem or mp_name == target.name:
+                        target = Path(mp).resolve()
+                        break
+                else:
+                    print(f"error: cannot find mount point for '{target.name}'", file=sys.stderr)
+                    print("try: shpack umount /path/to/mountpoint", file=sys.stderr)
+                    sys.exit(1)
+            except Exception:
+                print(f"error: cannot determine mount point for '{target.name}'", file=sys.stderr)
+                sys.exit(1)
+
+    r = subprocess.run(["fusermount3", "-u", str(target)], capture_output=True)
+    if r.returncode == 0:
+        print(f"unmounted {target}")
+    else:
+        err = r.stderr.decode().strip()
+        print(f"error: {err}", file=sys.stderr)
+        sys.exit(1)
+
+
 def main():
     ap = argparse.ArgumentParser(description="shpack - folder sharing done right")
     ap.add_argument("--force", "-f", action="store_true", help="overwrite existing output")
@@ -228,6 +398,16 @@ def main():
     p = sub.add_parser("info", help="show metadata of a .shp file")
     p.add_argument("source", help=".shp or .exe file")
 
+    p = sub.add_parser("mount", help="mount a .shp file as a directory (FUSE)")
+    p.add_argument("source", help=".shp or .exe file")
+    p.add_argument("mountpoint", nargs="?", help="mount point (default: <name>/)")
+    p.add_argument("--force", "-f", action="store_true", dest="force",
+                   help="mount even if mountpoint exists")
+    p.add_argument("--background", action="store_true", help="run in background")
+
+    p = sub.add_parser("umount", help="unmount a mounted .shp directory")
+    p.add_argument("target", help="mount point or .shp file")
+
     args = ap.parse_args()
 
     if args.cmd == "pack":
@@ -238,6 +418,10 @@ def main():
         list_contents(args)
     elif args.cmd == "info":
         info(args)
+    elif args.cmd == "mount":
+        mount_file(args)
+    elif args.cmd == "umount":
+        umount_file(args)
 
 
 if __name__ == "__main__":

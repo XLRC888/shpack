@@ -8,7 +8,7 @@
 #define LOC_SIG  0x04034b50
 #define COMPRESSION_FORMAT_DEFLATE 0x0002
 
-typedef struct {
+typedef struct __attribute__((packed)) {
     DWORD sig;
     WORD  disk;
     WORD  cd_disk;
@@ -19,7 +19,7 @@ typedef struct {
     WORD  comment_len;
 } EocdRec;
 
-typedef struct {
+typedef struct __attribute__((packed)) {
     DWORD sig;
     WORD  ver_made;
     WORD  ver_needed;
@@ -39,7 +39,7 @@ typedef struct {
     DWORD local_offset;
 } CenEntry;
 
-typedef struct {
+typedef struct __attribute__((packed)) {
     DWORD sig;
     WORD  ver_needed;
     WORD  flags;
